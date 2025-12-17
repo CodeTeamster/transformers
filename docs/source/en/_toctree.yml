@@ -897,6 +897,8 @@
         title: ViTMSN
       - local: model_doc/vitpose
         title: ViTPose
+      - local: model_doc/vit_rd
+        title: ViTRD
       - local: model_doc/yolos
         title: YOLOS
       - local: model_doc/zoedepth

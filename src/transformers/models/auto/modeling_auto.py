@@ -410,6 +410,8 @@ MODEL_MAPPING_NAMES = OrderedDict(
         ("vit_hybrid", "ViTHybridModel"),
         ("vit_mae", "ViTMAEModel"),
         ("vit_msn", "ViTMSNModel"),
+        ("vit_rd", "ViTRDModel"),
+        ("vit_rd", "ViTRDModel"),
         ("vitdet", "VitDetModel"),
         ("vits", "VitsModel"),
         ("vivit", "VivitModel"),
@@ -854,6 +856,22 @@ MODEL_FOR_IMAGE_CLASSIFICATION_MAPPING_NAMES = OrderedDict(
     [
         # Model for Image Classification mapping
         ("beit", "BeitForImageClassification"),
+        ("vit_rd", "ViTRDForMaskedImageModeling"),
+    ]
+)
+
+
+MODEL_FOR_CAUSAL_IMAGE_MODELING_MAPPING_NAMES = OrderedDict(
+    # Model for Causal Image Modeling mapping
+    [
+        ("imagegpt", "ImageGPTForCausalImageModeling"),
+    ]
+)
+
+MODEL_FOR_IMAGE_CLASSIFICATION_MAPPING_NAMES = OrderedDict(
+    [
+        # Model for Image Classification mapping
+        ("beit", "BeitForImageClassification"),
         ("bit", "BitForImageClassification"),
         ("clip", "CLIPForImageClassification"),
         ("convnext", "ConvNextForImageClassification"),
@@ -917,6 +935,7 @@ MODEL_FOR_IMAGE_CLASSIFICATION_MAPPING_NAMES = OrderedDict(
         ("vit", "ViTForImageClassification"),
         ("vit_hybrid", "ViTHybridForImageClassification"),
         ("vit_msn", "ViTMSNForImageClassification"),
+        ("vit_rd", "ViTRDForImageClassification"),
     ]
 )
 

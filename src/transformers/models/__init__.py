@@ -360,6 +360,7 @@ if TYPE_CHECKING:
     from .vit import *
     from .vit_mae import *
     from .vit_msn import *
+    from .vit_rd import *
     from .vitdet import *
     from .vitmatte import *
     from .vitpose import *
