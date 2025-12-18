@@ -247,7 +247,6 @@ class ViTRDSelfAttention(nn.Module):
         self,
         hidden_states: torch.Tensor,
         head_mask: Optional[torch.Tensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         batch_size = hidden_states.shape[0]
         new_shape = batch_size, -1, self.num_attention_heads, self.attention_head_size
@@ -265,7 +264,7 @@ class ViTRDSelfAttention(nn.Module):
             query_layer,
             key_layer,
             value_layer,
-            attention_mask,
+            head_mask,
             is_causal=self.is_causal,
             scaling=self.scaling,
             dropout=0.0 if not self.training else self.dropout_prob,
@@ -323,9 +322,8 @@ class ViTRDAttention(nn.Module):
         self,
         hidden_states: torch.Tensor,
         head_mask: Optional[torch.Tensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        self_attn_output, _ = self.attention(hidden_states, head_mask, attention_mask)
+        self_attn_output, _ = self.attention(hidden_states, head_mask)
         output = self.output(self_attn_output, hidden_states)
         return output
 
@@ -375,10 +373,9 @@ class ViTRDLayer(GradientCheckpointingLayer):
         self,
         hidden_states: torch.Tensor,
         head_mask: Optional[torch.Tensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         hidden_states_norm = self.layernorm_before(hidden_states)
-        attention_output = self.attention(hidden_states_norm, head_mask, attention_mask)
+        attention_output = self.attention(hidden_states_norm, head_mask)
 
         # first residual connection
         hidden_states = attention_output + hidden_states
@@ -498,22 +495,18 @@ class ViTRDEncoder(nn.Module):
                     seed=seed,
                 )
 
-            attention_mask = torch.ones(
-                hidden_states.shape[0],
-                self.config.num_attention_heads,
-                hidden_states.shape[1],
-                hidden_states.shape[1],
-                device=hidden_states.device,
-            )
+            sup_mask = torch.ones_like(hidden_states, device=hidden_states.device)
             if self.config.supplement_token == 'layerwise1':
-                attention_mask[..., 1 : 1 + self.config.num_hidden_layers, :] = 0
-                attention_mask[..., 1 + i, :] = 1
+                sup_mask[:, 1 : 1 + self.config.num_hidden_layers, :] = 0
+                sup_mask[:, 1 + i, :] = 1
             elif self.config.supplement_token == 'layerwise2':
-                attention_mask[..., 1 : 1 + self.config.num_hidden_layers * 2, :] = 0
-                attention_mask[..., 1 + i * 2 : 3 + i * 2, :] = 1
+                sup_mask[:, 1 : 1 + self.config.num_hidden_layers * 2, :] = 0
+                sup_mask[:, 1 + i * 2 : 3 + i * 2, :] = 1
 
+            masked_hidden_states = hidden_states * sup_mask
             layer_head_mask = head_mask[i] if head_mask is not None else None
-            hidden_states = layer_module(hidden_states, layer_head_mask, attention_mask)
+            masked_hidden_states = layer_module(masked_hidden_states, layer_head_mask)
+            hidden_states = masked_hidden_states + (1 - sup_mask) * hidden_states
 
         return BaseModelOutput(last_hidden_state=hidden_states)
 
