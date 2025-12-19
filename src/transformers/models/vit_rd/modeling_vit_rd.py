@@ -22,6 +22,7 @@
 
 import collections.abc
 import math
+import os
 from typing import Callable, Optional, Union, List
 
 import torch
@@ -457,6 +458,94 @@ class ViTRDEncoder(nn.Module):
 
         return hidden_states
 
+    def _divprune_token_choose(
+        self,
+        visual_hidden_states: torch.Tensor,
+        visual_token_len: int,
+        keep_ratio: float=0.1,
+    ):
+        """
+        Diversity Pruning Implementation.
+
+        Args:
+            visual_hidden_states (torch.Tensor): The visual feature vectors to be pruned.
+            visual_token_len (int): The length of the image feature vectors.
+            keep_ratio (float): The ratio of features to keep based on diversity pruning.
+        """
+        def _pairwise_cosine_similarity(hidden_states: torch.Tensor) -> torch.Tensor:
+            # hidden_states (batch_size, num_patches, feature_dim)
+            norm_hidden_states = hidden_states / (hidden_states.norm(dim=-1, keepdim=True) + 1e-8)
+            cosine_matrix = torch.matmul(norm_hidden_states, norm_hidden_states.transpose(1, 2))
+
+            # cosine_matrix (batch_size, num_patches, num_patches)
+            return cosine_matrix
+
+        # make sure keep len is an integer
+        keep_len = int(round(keep_ratio * visual_token_len))
+        # the closer to 0, the more similar
+        cosine_matrix = 1.0 - (_pairwise_cosine_similarity(visual_hidden_states))
+
+        s = torch.empty(
+            visual_hidden_states.shape[0],
+            keep_len,
+            dtype=torch.long,
+            device=visual_hidden_states.device
+        )
+        for i in range(keep_len):
+            if i == 0:
+                m2 = cosine_matrix
+            else:
+                s_expanded = s.unsqueeze(-1).expand(-1, -1, cosine_matrix.size(2))
+                m2 = torch.gather(cosine_matrix, dim=1, index=s_expanded[:, :i, :])
+
+            # Step1: DivPrune requires selecting the token[j] that is most similar to each token[i].
+            if i == 0:
+                # dim = 1 (select the top2 in each column of each batch)，largest=False (choose the least)
+                # torch.top2 (batch_size, 2, num_patches)
+                # values[:, 1, :] (batch_size, num_patches)
+                scores = torch.topk(m2, 2, dim=1, largest=False).values[:, 1, :]
+            else:
+                # get the minimal similarity score to selected token set (s) for each token
+                scores = torch.min(m2, dim=1).values
+
+            # Step2: choose the maximal score of scores (find the least similar among the most similar)
+            s[:, i] = torch.argmax(scores, dim=1)
+
+        return s
+
+    def _divprune(
+        self,
+        hidden_states: torch.Tensor,
+        head_token_len: int,
+        keep_ratio: float,
+    ):
+        if keep_ratio == None or keep_ratio >= 1.0 or keep_ratio <= 0.0:
+            return hidden_states
+
+        if head_token_len == None:
+            head_token_len = 0
+
+        # what is returned is the "index" of the retained visual token
+        keep_indices = self._divprune_token_choose(
+            hidden_states[:, head_token_len:, :],
+            int(hidden_states.shape[1] - head_token_len),
+            keep_ratio,
+        )
+
+        # add offset head_token_len to get the real index in hidden_states
+        keep_indices += head_token_len
+        keep_indices = torch.cat(
+            (
+                torch.arange(head_token_len, device=hidden_states.device).unsqueeze(0).expand(keep_indices.size(0), -1),
+                keep_indices,
+            ),
+            dim=1,
+        )
+        keep_indices = keep_indices.sort(dim=1).values
+        keep_indices = keep_indices.unsqueeze(-1).expand(-1, -1, hidden_states.shape[-1])
+
+        return torch.gather(hidden_states, dim=1, index=keep_indices)
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -465,6 +554,22 @@ class ViTRDEncoder(nn.Module):
         discard_before_layers: Optional[List[bool]] = None,
         seed: Optional[int] = None,
     ) -> BaseModelOutput:
+        head_token_len = 1
+        if self.config.supplement_token is not None:
+            if isinstance(self.config.supplement_token, int):
+                head_token_len += self.config.supplement_token
+            elif self.config.supplement_token == 'layerwise1':
+                head_token_len += self.config.num_hidden_layers
+            elif self.config.supplement_token == 'layerwise2':
+                head_token_len += self.config.num_hidden_layers * 2
+        if os.environ.get("DIVPRUNE"):
+            keep_ratio = round(float(os.environ.get("DIVPRUNE")), 1)
+            hidden_states = self._divprune(
+                hidden_states=hidden_states,
+                head_token_len=head_token_len,
+                keep_ratio=keep_ratio,
+            )
+
         for i, layer_module in enumerate(self.layer):
             if (
                 discard_rate is not None
