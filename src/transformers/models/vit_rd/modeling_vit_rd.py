@@ -257,8 +257,10 @@ class ViTRDSelfAttention(nn.Module):
         query_layer = self.query(hidden_states).view(*new_shape).transpose(1, 2)
 
         attention_interface: Callable = eager_attention_forward
-        if self.config._attn_implementation != "eager":
-            attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
+        # EViT need attention_probs for token dropping
+        if os.environ.get("EViT") in ("0", None, ""):
+            if self.config._attn_implementation != "eager":
+                attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
 
         context_layer, attention_probs = attention_interface(
             self,
@@ -324,9 +326,9 @@ class ViTRDAttention(nn.Module):
         hidden_states: torch.Tensor,
         head_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        self_attn_output, _ = self.attention(hidden_states, head_mask)
+        self_attn_output, self_attn_probs = self.attention(hidden_states, head_mask)
         output = self.output(self_attn_output, hidden_states)
-        return output
+        return output, self_attn_probs
 
 
 class ViTRDIntermediate(nn.Module):
@@ -362,6 +364,7 @@ class ViTRDLayer(GradientCheckpointingLayer):
 
     def __init__(self, config: ViTRDConfig):
         super().__init__()
+        self.config = config
         self.chunk_size_feed_forward = config.chunk_size_feed_forward
         self.seq_len_dim = 1
         self.attention = ViTRDAttention(config)
@@ -370,16 +373,107 @@ class ViTRDLayer(GradientCheckpointingLayer):
         self.layernorm_before = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
         self.layernorm_after = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
 
+    def _evit(
+        self,
+        hidden_states: torch.Tensor,
+        cls_attention_probs: torch.Tensor,
+        keep_ratio: float=0.1,
+        fuse_token: bool=False,
+    ) -> torch.Tensor:
+        """
+        Implements EViT token pruning based on cls attention scores.
+        Args:
+            hidden_states (torch.Tensor): The input hidden states of shape [B, N, C].
+            cls_attention_probs (torch.Tensor): The cls attention scores of shape [B, H, N - 1 - sup_token].
+            keep_ratio (float): The ratio of tokens to keep based on cls attention scores.
+            fuse_token (bool): Whether to fuse the pruned tokens into the new extra token.
+        Returns:
+            torch.Tensor: The pruned hidden states.
+        """
+        keep_len = round(keep_ratio * cls_attention_probs.shape[-1])
+        if keep_len == cls_attention_probs.shape[-1] or keep_len == 0:
+            return hidden_states
+
+        # [B, H, N - 1 - sup_token]
+        cls_attention_probs = cls_attention_probs.mean(dim=1)
+        # [B, keep_len]
+        keep_indices = torch.topk(cls_attention_probs, keep_len, dim=1, largest=True).indices
+        head_token_len = hidden_states.shape[1] - cls_attention_probs.shape[-1]
+        keep_indices_real = keep_indices + head_token_len
+        # [B, cls + sup + keep_len]
+        keep_indices_real = torch.cat(
+            (
+                torch.arange(head_token_len, device=hidden_states.device).unsqueeze(0).expand(hidden_states.shape[0], -1),
+                keep_indices_real,
+            ),
+            dim=1,
+        )
+        keep_indices_real = keep_indices_real.sort(dim=1).values
+
+        output_hidden_states = torch.gather(
+            hidden_states,
+            dim=1,
+            index=keep_indices_real.unsqueeze(-1).expand(-1, -1, hidden_states.shape[-1]),
+        )
+
+        if fuse_token is False:
+            return output_hidden_states
+
+        all_indices = torch.arange(
+            cls_attention_probs.shape[1],
+            device=hidden_states.device
+        ).unsqueeze(0).expand(cls_attention_probs.shape[0], -1)
+        marker = torch.full_like(all_indices, fill_value=0, device=hidden_states.device)
+        marker.scatter_(dim=1, index=keep_indices, value=-1)
+        prune_mask = marker != -1
+        # [B, prune_len]
+        prune_indices = all_indices[prune_mask].view(keep_indices.shape[0], -1)
+        # [B, prune_len, C]
+        prune_token = torch.gather(
+            hidden_states[:, head_token_len:, :],
+            dim=1,
+            index=prune_indices.unsqueeze(-1).expand(-1, -1, hidden_states.shape[-1]),
+        )
+        prune_attention_probs = torch.gather(
+            cls_attention_probs,
+            dim=1,
+            index=prune_indices,
+        )
+        extra_token = torch.sum(
+            prune_token * prune_attention_probs.unsqueeze(-1),
+            dim=1,
+            keepdim=True,
+        )
+        return torch.cat([output_hidden_states, extra_token], dim=1)
+
     def forward(
         self,
         hidden_states: torch.Tensor,
         head_mask: Optional[torch.Tensor] = None,
+        output_attentions: bool = False,
     ) -> torch.Tensor:
         hidden_states_norm = self.layernorm_before(hidden_states)
-        attention_output = self.attention(hidden_states_norm, head_mask)
+        attention_output, attention_probs = self.attention(hidden_states_norm, head_mask)
 
         # first residual connection
         hidden_states = attention_output + hidden_states
+
+        # EViT
+        if os.environ.get("EViT") not in ("0", None, "") and output_attentions is True:
+            # cls attentions [B, H, N - 1 - sup_token]
+            if self.config.supplement_token is not None:
+                if isinstance(self.config.supplement_token, int):
+                    cls_attention_probs = attention_probs[:, :, 0, 1 + self.config.supplement_token:]
+                elif self.config.supplement_token == 'layerwise1':
+                    cls_attention_probs = attention_probs[:, :, 0, 1 + self.config.num_hidden_layers:]
+                elif self.config.supplement_token == 'layerwise2':
+                    cls_attention_probs = attention_probs[:, :, 0, 1 + self.config.num_hidden_layers * 2:]
+            hidden_states = self._evit(
+                hidden_states=hidden_states,
+                cls_attention_probs=cls_attention_probs,
+                keep_ratio=round(float(os.environ.get("EViT")), 1),
+                fuse_token=True,
+            )
 
         # in ViTRD, layernorm is also applied after self-attention
         layer_output = self.layernorm_after(hidden_states)
@@ -610,7 +704,12 @@ class ViTRDEncoder(nn.Module):
 
             masked_hidden_states = hidden_states * sup_mask
             layer_head_mask = head_mask[i] if head_mask is not None else None
-            masked_hidden_states = layer_module(masked_hidden_states, layer_head_mask)
+            if os.environ.get("EViT") not in ("0", None, "") and i in (3, 6, 9):
+                masked_hidden_states = layer_module(masked_hidden_states, layer_head_mask, True)
+                sup_mask = sup_mask[:, : masked_hidden_states.shape[1], :]
+                hidden_states = hidden_states[:, : masked_hidden_states.shape[1], :]
+            else:
+                masked_hidden_states = layer_module(masked_hidden_states, layer_head_mask, False)
             hidden_states = masked_hidden_states + (1 - sup_mask) * hidden_states
 
         return BaseModelOutput(last_hidden_state=hidden_states)
