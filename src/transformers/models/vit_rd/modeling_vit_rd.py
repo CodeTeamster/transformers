@@ -56,7 +56,7 @@ class ViTRDEmbeddings(nn.Module):
         num_patches = self.patch_embeddings.num_patches + 1
         self.cls_token = nn.Parameter(torch.randn(1, 1, config.hidden_size))
         if hasattr(config, "supplement_token"):
-            if isinstance(config.supplement_token, int):
+            if isinstance(config.supplement_token, int) and config.supplement_token > 0:
                 self.sup_token = nn.Parameter(
                     torch.randn(1, config.supplement_token, config.hidden_size)
                 )
@@ -471,7 +471,7 @@ class ViTRDLayer(GradientCheckpointingLayer):
             hidden_states = self._evit(
                 hidden_states=hidden_states,
                 cls_attention_probs=cls_attention_probs,
-                keep_ratio=round(float(os.environ.get("EViT")), 1),
+                keep_ratio=round(float(os.environ.get("EViT")), 2),
                 fuse_token=True,
             )
 
@@ -657,7 +657,7 @@ class ViTRDEncoder(nn.Module):
             elif self.config.supplement_token == 'layerwise2':
                 head_token_len += self.config.num_hidden_layers * 2
         if os.environ.get("DIVPRUNE"):
-            keep_ratio = round(float(os.environ.get("DIVPRUNE")), 1)
+            keep_ratio = round(float(os.environ.get("DIVPRUNE")), 2)
             hidden_states = self._divprune(
                 hidden_states=hidden_states,
                 head_token_len=head_token_len,
