@@ -23,6 +23,7 @@
 import collections.abc
 import math
 import os
+import random
 from typing import Callable, Optional, Union, List
 
 import torch
@@ -390,7 +391,7 @@ class ViTRDLayer(GradientCheckpointingLayer):
         Returns:
             torch.Tensor: The pruned hidden states.
         """
-        keep_len = round(keep_ratio * cls_attention_probs.shape[-1])
+        keep_len = math.ceil(keep_ratio * cls_attention_probs.shape[-1])
         if keep_len == cls_attention_probs.shape[-1] or keep_len == 0:
             return hidden_states
 
@@ -468,6 +469,8 @@ class ViTRDLayer(GradientCheckpointingLayer):
                     cls_attention_probs = attention_probs[:, :, 0, 1 + self.config.num_hidden_layers:]
                 elif self.config.supplement_token == 'layerwise2':
                     cls_attention_probs = attention_probs[:, :, 0, 1 + self.config.num_hidden_layers * 2:]
+            else:
+                cls_attention_probs = attention_probs[:, :, 0, 1:]
             hidden_states = self._evit(
                 hidden_states=hidden_states,
                 cls_attention_probs=cls_attention_probs,
@@ -667,12 +670,16 @@ class ViTRDEncoder(nn.Module):
         for i, layer_module in enumerate(self.layer):
             if (
                 discard_rate is not None
+                and discard_rate != 0.0
                 and discard_before_layers is not None
                 and len(discard_before_layers) == self.config.num_hidden_layers
-                and discard_rate > 0.0
-                and discard_rate < 1.0
                 and discard_before_layers[i]
             ):
+                if discard_rate < 0.0:
+                    real_discard_rate = random.uniform(0.0, abs(discard_rate))
+                else:
+                    real_discard_rate = discard_rate
+
                 ignored_mask = torch.zeros(
                     hidden_states.shape[1],
                     dtype=torch.bool,
@@ -690,7 +697,7 @@ class ViTRDEncoder(nn.Module):
                 hidden_states = self._random_discard(
                     hidden_states=hidden_states,
                     ignored_mask=ignored_mask,
-                    discard_rate=discard_rate,
+                    discard_rate=real_discard_rate,
                     seed=seed,
                 )
 
