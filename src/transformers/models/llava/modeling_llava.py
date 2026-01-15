@@ -18,6 +18,9 @@ from dataclasses import dataclass
 from typing import Optional, Union
 
 import torch
+import os
+import json
+import random
 from torch import nn
 
 from ...activations import ACT2FN
@@ -445,10 +448,82 @@ class LlavaForConditionalGeneration(LlavaPreTrainedModel, GenerationMixin):
             loss=loss,
             logits=logits,
             past_key_values=outputs.past_key_values,
-            hidden_states=outputs.hidden_states,
+            hidden_states=outputs.hidden_states if outputs.hidden_states is not None else hidden_states,
             attentions=outputs.attentions,
             image_hidden_states=outputs.image_hidden_states,
         )
+
+    def _prepare_inputs_for_discard(
+        self,
+        input_ids,
+        inputs_embeds=None,
+        attention_mask=None,
+        cache_position=None,
+        discard_rate=None,
+        discard_before_layer=None,
+    ):
+        if input_ids is None or discard_rate is None or discard_rate == 0.0 or discard_before_layer is None:
+            return input_ids, inputs_embeds, attention_mask, cache_position
+
+        discard_times = sum(discard_before_layer)
+        keep_image_len = (self.config.vision_config.image_size // self.config.vision_config.patch_size) ** 2
+        for i in range(discard_times):
+            keep_image_len = round(keep_image_len * (1.0 - discard_rate))
+
+        special_image_mask = input_ids == self.config.image_token_id
+        non_image_mask = ~special_image_mask
+        full_indices = torch.arange(
+            input_ids.shape[1],
+            device=special_image_mask.device
+        ).unsqueeze(0).expand(input_ids.shape[0], -1)
+        no_image_indices = [full_indices[i][non_image_mask[i]] for i in range(full_indices.shape[0])]
+        no_image_indices = torch.cat(no_image_indices, dim=0).view(full_indices.shape[0], -1)
+
+        start_idx = torch.argmax(special_image_mask.int(), dim=1)
+        offsets = torch.arange(keep_image_len, device=special_image_mask.device)
+        image_indices_after_prune = start_idx.unsqueeze(1) + offsets.unsqueeze(0)
+
+        full_indices_after_prune = torch.cat((image_indices_after_prune, no_image_indices), dim=1)
+        full_indices_after_prune = torch.sort(full_indices_after_prune, dim=1).values
+
+        input_ids = torch.gather(
+            input_ids,
+            1,
+            full_indices_after_prune,
+        )
+        if inputs_embeds is not None:
+            inputs_embeds = torch.gather(
+                inputs_embeds,
+                1,
+                full_indices_after_prune.unsqueeze(-1).expand(-1, -1, inputs_embeds.shape[-1]),
+            )
+        if attention_mask is not None:
+            attention_mask = torch.gather(
+                attention_mask,
+                1,
+                full_indices_after_prune,
+            )
+        if cache_position is not None:
+            cache_position = cache_position[:full_indices_after_prune.shape[1]]
+
+        return input_ids, inputs_embeds, attention_mask, cache_position
+
+    def process_input_ids_for_discard(
+        self,
+        input_ids,
+        discard_rate=None,
+        discard_before_layer=None,
+    ):
+        if input_ids is None or discard_rate is None or discard_rate == 0.0 or discard_before_layer is None:
+            return input_ids
+
+        input_ids, _, _, _ = self._prepare_inputs_for_discard(
+            input_ids=input_ids,
+            discard_rate=discard_rate,
+            discard_before_layer=discard_before_layer,
+        )
+
+        return input_ids
 
     def prepare_inputs_for_generation(
         self,
@@ -462,6 +537,25 @@ class LlavaForConditionalGeneration(LlavaPreTrainedModel, GenerationMixin):
         **kwargs,
     ):
         # Overwritten -- in specific circumstances we don't want to forward image inputs to the model
+        # For positioning the prefill stage.
+        if (
+            cache_position is not None
+            and cache_position.shape[0] > 1
+            and os.environ.get('RANDOM_DISCARD') is not None
+        ):
+            random_discard = json.loads(os.environ['RANDOM_DISCARD'])
+            if random_discard['discard_rate'] < 0.0:
+                discard_rate = random.uniform(0.0, abs(random_discard['discard_rate']))
+            else:
+                discard_rate = random_discard['discard_rate']
+            input_ids, inputs_embeds, attention_mask, cache_position = self._prepare_inputs_for_discard(
+                input_ids=input_ids,
+                inputs_embeds=inputs_embeds,
+                attention_mask=attention_mask,
+                cache_position=cache_position,
+                discard_rate=discard_rate,
+                discard_before_layer=random_discard['discard_before_layer'],
+            )
 
         model_inputs = super().prepare_inputs_for_generation(
             input_ids,

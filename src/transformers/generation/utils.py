@@ -2778,11 +2778,19 @@ class GenerationMixin(ContinuousMixin):
 
         while self._has_unfinished_sequences(this_peer_finished, synced_gpus, device=input_ids.device):
             # prepare model inputs
+            # model_inputs: 'cache_position', 'past_key_values', 'input_ids', 'inputs_embeds', 'position_ids', 'attention_mask', 'logits_to_keep', 'use_cache', ['pixel_values']
             model_inputs = self.prepare_inputs_for_generation(input_ids, **model_kwargs)
 
+            # model_kwargs: 'attention_mask', 'pixel_values', 'logits_to_keep', 'past_key_values', 'use_cache', 'cache_position'
             if is_prefill:
                 outputs = self(**model_inputs, return_dict=True)
                 is_prefill = False
+                if os.environ.get('RANDOM_DISCARD') is not None:
+                    if "attention_mask" in model_kwargs:
+                        model_kwargs["attention_mask"] = model_kwargs["attention_mask"][:, :outputs.hidden_states.shape[1]]
+                    if model_kwargs.get("use_cache", True):
+                        model_kwargs["cache_position"] = model_kwargs["cache_position"][:outputs.hidden_states.shape[1]]
+                    input_ids = model_inputs['input_ids']
             else:
                 outputs = model_forward(**model_inputs, return_dict=True)
 
