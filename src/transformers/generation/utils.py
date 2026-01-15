@@ -21,6 +21,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Callable, Optional, Union
 
 import torch
+import json
 import torch.distributed as dist
 from packaging import version
 from torch import nn
@@ -2778,11 +2779,22 @@ class GenerationMixin(ContinuousMixin):
 
         while self._has_unfinished_sequences(this_peer_finished, synced_gpus, device=input_ids.device):
             # prepare model inputs
+            # model_inputs: 'cache_position', 'past_key_values', 'input_ids', 'inputs_embeds', 'position_ids', 'attention_mask', 'logits_to_keep', 'use_cache', ['pixel_values']
             model_inputs = self.prepare_inputs_for_generation(input_ids, **model_kwargs)
 
+            # model_kwargs: 'attention_mask', 'pixel_values', 'logits_to_keep', 'past_key_values', 'use_cache', 'cache_position'
             if is_prefill:
                 outputs = self(**model_inputs, return_dict=True)
                 is_prefill = False
+                if os.environ.get('RANDOM_DISCARD') is not None:
+                    random_discard = json.loads(os.environ['RANDOM_DISCARD'])
+                    input_ids, _, model_kwargs["attention_mask"], model_kwargs["cache_position"] = self.prepare_inputs_for_discard(
+                        input_ids=model_inputs['input_ids'],
+                        attention_mask=model_kwargs["attention_mask"],
+                        cache_position=model_kwargs["cache_position"] if model_kwargs.get("use_cache", True) else None,
+                        discard_rate=random_discard["discard_rate"],
+                        discard_before_layer=random_discard["discard_before_layer"],
+                    )
             else:
                 outputs = model_forward(**model_inputs, return_dict=True)
 
