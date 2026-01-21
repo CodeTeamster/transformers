@@ -30,6 +30,8 @@ from typing import Any, Callable, Optional, Union
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import os
+import json
 
 from ...activations import ACT2FN
 from ...cache_utils import Cache, DynamicCache
@@ -787,6 +789,75 @@ class Qwen2_5_VLTextModel(Qwen2_5_VLPreTrainedModel):
         # Initialize weights and apply final processing
         self.post_init()
 
+    def _random_discard(
+        self,
+        hidden_states: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor],
+        cache_position: Optional[torch.LongTensor] = None,
+        text_position_ids: Optional[torch.LongTensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        ignored_mask: Optional[torch.Tensor] = None,
+        discard_rate: Optional[float] = None,
+        seed: Optional[int] = None,
+    ) -> torch.Tensor:
+        """
+        Randomly discard a portion of tokens during training for efficiency,
+        excluding tokens in `ignored_mask`.
+        """
+        if not discard_rate or discard_rate <= 0.0:
+            return hidden_states, position_embeddings, cache_position, text_position_ids, attention_mask
+
+        batch_size, seq_len, _ = hidden_states.shape
+        device = hidden_states.device
+
+         # Mask for candidate indices (non-ignored tokens)
+        if ignored_mask is None:
+            candidate_mask = torch.ones(seq_len, dtype=torch.bool, device=device)
+            ignored_indices = (
+                torch.tensor([], dtype=torch.long, device=device)
+                .unsqueeze(0)
+                .expand(batch_size, -1)
+            )
+        else:
+            candidate_mask = ~ignored_mask
+            ignored_indices = (
+                ignored_mask.nonzero(as_tuple=True)[0]
+                .unsqueeze(0)
+                .repeat(batch_size, 1)
+            )
+        candidate_indices = (
+            torch.arange(seq_len, device=device)
+            .unsqueeze(0)
+            .repeat(batch_size, 1)[:, candidate_mask]
+        )
+        candidate_len = candidate_indices.shape[1]
+        keep_len = round(candidate_len * (1.0 - discard_rate))
+
+        # Randomly shuffle candidate indices for each sample in the batch
+        rand_indices = torch.rand(
+            batch_size,
+            candidate_len,
+            generator=torch.Generator(device=device).manual_seed(seed) if seed else None,
+            device=device,
+        ).argsort(dim=-1)
+        # Select indices to keep
+        keep_indices = rand_indices[:, :keep_len]
+        # Map selected indices to the original sequence
+        keep_indices = torch.gather(candidate_indices, dim=1, index=keep_indices)
+        # Add ignored indices (e.g., CLS token) to the keep indices
+        keep_indices = torch.cat([ignored_indices, keep_indices], dim=-1).sort(dim=-1)[0]
+
+        # Gather the tokens based on the keep indices
+        batch_indices = torch.arange(batch_size, device=device).unsqueeze(1)
+        hidden_states = hidden_states[batch_indices, keep_indices, :]
+        cos = position_embeddings[0][:, batch_indices, keep_indices, :]
+        sin = position_embeddings[1][:, batch_indices, keep_indices, :]
+        cache_position = cache_position[keep_indices.squeeze(0)] if cache_position is not None else None
+        text_position_ids = text_position_ids[batch_indices, keep_indices] if text_position_ids is not None else None
+        attention_mask = attention_mask[batch_indices, keep_indices] if attention_mask is not None else None
+
+        return hidden_states, (cos, sin), cache_position, text_position_ids, attention_mask
+
     @auto_docstring
     def forward(
         self,
@@ -884,7 +955,40 @@ class Qwen2_5_VLTextModel(Qwen2_5_VLPreTrainedModel):
         all_hidden_states = () if output_hidden_states else None
         all_self_attns = () if output_attentions else None
 
-        for decoder_layer in self.layers:
+        for idx, decoder_layer in enumerate(self.layers):
+            # cache_position[0] is used to determine the prefill stage.
+            if (
+                cache_position[0] == 0
+                and os.environ.get('RANDOM_DISCARD') is not None
+            ):
+                if kwargs["image_mask"].dim() == 3:
+                    # each batch use the same mask
+                    kwargs["image_mask"] = kwargs["image_mask"][:, :, 0].squeeze(-1).squeeze(0)
+                    text_indices = torch.where(~kwargs["image_mask"])[0]
+                    sys_text_cnt = (text_indices < text_indices[0] + (kwargs["image_mask"] == True).nonzero(as_tuple=True)[0][0]).sum()
+                    usr_text_cnt = len(text_indices) - sys_text_cnt
+
+                random_discard = json.loads(os.environ['RANDOM_DISCARD'])
+                if random_discard['discard_before_layer'][idx]:
+                    ignored_mask = torch.zeros(
+                        hidden_states.shape[1],
+                        dtype=torch.bool,
+                        device=hidden_states.device
+                    )
+                    ignored_mask[:sys_text_cnt] = True
+                    ignored_mask[-usr_text_cnt:] = True
+
+                    hidden_states, position_embeddings, cache_position, text_position_ids, attention_mask = self._random_discard(
+                        hidden_states=hidden_states,
+                        position_embeddings=position_embeddings,
+                        cache_position=cache_position,
+                        text_position_ids=text_position_ids,
+                        attention_mask=attention_mask,
+                        ignored_mask=ignored_mask,
+                        discard_rate=random_discard['discard_rate'],
+                        seed=random_discard['discard_seed'],
+                    )
+
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
@@ -1313,6 +1417,7 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
             output_hidden_states=output_hidden_states,
             return_dict=True,
             cache_position=cache_position,
+            image_mask=image_mask if pixel_values is not None else None,
             **kwargs,
         )
 
@@ -1512,6 +1617,65 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
             attentions=outputs.attentions,
             rope_deltas=outputs.rope_deltas,
         )
+
+    def prepare_inputs_for_discard(
+        self,
+        input_ids,
+        inputs_embeds=None,
+        attention_mask=None,
+        cache_position=None,
+        discard_rate=None,
+        discard_before_layer=None,
+    ):
+        if input_ids is None or discard_rate is None or discard_rate == 0.0 or discard_before_layer is None:
+            return input_ids, inputs_embeds, attention_mask, cache_position
+
+        discard_times = sum(discard_before_layer)
+        special_image_mask = input_ids == self.config.image_token_id
+        keep_image_len = special_image_mask.sum(dim=-1)[0].item()
+        for i in range(discard_times):
+            keep_image_len = round(keep_image_len * (1.0 - discard_rate))
+
+        non_image_mask = ~special_image_mask
+        full_indices = torch.arange(
+            input_ids.shape[1],
+            device=special_image_mask.device
+        ).unsqueeze(0).expand(input_ids.shape[0], -1)
+        no_image_indices = [full_indices[i][non_image_mask[i]] for i in range(full_indices.shape[0])]
+        no_image_indices = torch.cat(no_image_indices, dim=0).view(full_indices.shape[0], -1)
+
+        start_idx = torch.argmax(special_image_mask.int(), dim=1)
+        offsets = torch.arange(keep_image_len, device=special_image_mask.device)
+        image_indices_after_prune = start_idx.unsqueeze(1) + offsets.unsqueeze(0)
+
+        full_indices_after_prune = torch.cat((image_indices_after_prune, no_image_indices), dim=1)
+        full_indices_after_prune = torch.sort(full_indices_after_prune, dim=1).values
+
+        input_ids = torch.gather(
+            input_ids,
+            1,
+            full_indices_after_prune,
+        )
+        if inputs_embeds is not None:
+            inputs_embeds = torch.gather(
+                inputs_embeds,
+                1,
+                full_indices_after_prune.unsqueeze(-1).expand(-1, -1, inputs_embeds.shape[-1]),
+            )
+        if attention_mask is not None:
+            attention_mask = torch.gather(
+                attention_mask,
+                1,
+                full_indices_after_prune,
+            )
+        if cache_position is not None:
+            cache_position = torch.gather(
+                cache_position,
+                0,
+                full_indices_after_prune.squeeze(0),
+            )
+
+        return input_ids, inputs_embeds, attention_mask, cache_position
 
     def prepare_inputs_for_generation(
         self,
