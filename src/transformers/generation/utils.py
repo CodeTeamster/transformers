@@ -2788,13 +2788,17 @@ class GenerationMixin(ContinuousMixin):
                 is_prefill = False
                 if os.environ.get('RANDOM_DISCARD') is not None:
                     random_discard = json.loads(os.environ['RANDOM_DISCARD'])
-                    input_ids, _, model_kwargs["attention_mask"], model_kwargs["cache_position"] = self.prepare_inputs_for_discard(
-                        input_ids=model_inputs['input_ids'],
-                        attention_mask=model_kwargs["attention_mask"],
-                        cache_position=model_kwargs["cache_position"] if model_kwargs.get("use_cache", True) else None,
-                        discard_rate=random_discard["discard_rate"],
-                        discard_before_layer=random_discard["discard_before_layer"],
-                    )
+                    if (
+                        random_discard["discard_rate"] > 0
+                        and all(not x for x in random_discard["discard_before_layer"]) is not True
+                    ):
+                        input_ids, _, model_kwargs["attention_mask"], model_kwargs["cache_position"] = self.prepare_inputs_for_discard(
+                            input_ids=model_inputs['input_ids'],
+                            attention_mask=model_kwargs["attention_mask"],
+                            cache_position=model_kwargs["cache_position"] if model_kwargs.get("use_cache", True) else None,
+                            discard_rate=random_discard["discard_rate"],
+                            discard_before_layer=random_discard["discard_before_layer"],
+                        )
             else:
                 outputs = model_forward(**model_inputs, return_dict=True)
 
