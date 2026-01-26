@@ -19,6 +19,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
+import json
 from typing import Callable, Optional, Union
 
 import torch
@@ -351,6 +353,75 @@ class Qwen3Model(Qwen3PreTrainedModel):
         # Initialize weights and apply final processing
         self.post_init()
 
+    def _random_discard(
+        self,
+        hidden_states: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor],
+        cache_position: Optional[torch.LongTensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        ignored_mask: Optional[torch.Tensor] = None,
+        discard_rate: Optional[float] = None,
+        seed: Optional[int] = None,
+    ) -> torch.Tensor:
+        """
+        Randomly discard a portion of tokens during training for efficiency,
+        excluding tokens in `ignored_mask`.
+        """
+        if not discard_rate or discard_rate <= 0.0:
+            return hidden_states, position_embeddings, cache_position, position_ids, attention_mask
+
+        batch_size, seq_len, _ = hidden_states.shape
+        device = hidden_states.device
+
+         # Mask for candidate indices (non-ignored tokens)
+        if ignored_mask is None:
+            candidate_mask = torch.ones(seq_len, dtype=torch.bool, device=device)
+            ignored_indices = (
+                torch.tensor([], dtype=torch.long, device=device)
+                .unsqueeze(0)
+                .expand(batch_size, -1)
+            )
+        else:
+            candidate_mask = ~ignored_mask
+            ignored_indices = (
+                ignored_mask.nonzero(as_tuple=True)[0]
+                .unsqueeze(0)
+                .repeat(batch_size, 1)
+            )
+        candidate_indices = (
+            torch.arange(seq_len, device=device)
+            .unsqueeze(0)
+            .repeat(batch_size, 1)[:, candidate_mask]
+        )
+        candidate_len = candidate_indices.shape[1]
+        keep_len = round(candidate_len * (1.0 - discard_rate))
+
+        # Randomly shuffle candidate indices for each sample in the batch
+        rand_indices = torch.rand(
+            batch_size,
+            candidate_len,
+            generator=torch.Generator(device=device).manual_seed(seed) if seed else None,
+            device=device,
+        ).argsort(dim=-1)
+        # Select indices to keep
+        keep_indices = rand_indices[:, :keep_len]
+        # Map selected indices to the original sequence
+        keep_indices = torch.gather(candidate_indices, dim=1, index=keep_indices)
+        # Add ignored indices (e.g., CLS token) to the keep indices
+        keep_indices = torch.cat([ignored_indices, keep_indices], dim=-1).sort(dim=-1)[0]
+
+        # Gather the tokens based on the keep indices
+        batch_indices = torch.arange(batch_size, device=device).unsqueeze(1)
+        hidden_states = hidden_states[batch_indices, keep_indices, :]
+        cos = position_embeddings[0][batch_indices, keep_indices, :]
+        sin = position_embeddings[1][batch_indices, keep_indices, :]
+        cache_position = cache_position[keep_indices.squeeze(0)] if cache_position is not None else None
+        position_ids = position_ids[batch_indices, keep_indices] if position_ids is not None else None
+        attention_mask = attention_mask[batch_indices, keep_indices] if attention_mask is not None else None
+
+        return hidden_states, (cos, sin), cache_position, position_ids, attention_mask
+
     @check_model_inputs()
     @auto_docstring
     def forward(
@@ -406,7 +477,40 @@ class Qwen3Model(Qwen3PreTrainedModel):
         # create position embeddings to be shared across the decoder layers
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
 
-        for decoder_layer in self.layers[: self.config.num_hidden_layers]:
+        for idx, decoder_layer in enumerate(self.layers[: self.config.num_hidden_layers]):
+            # cache_position[0] is used to determine the prefill stage.
+            if (
+                cache_position[0] == 0
+                and os.environ.get('RANDOM_DISCARD') is not None
+            ):
+                if kwargs.get("image_mask") is not None and kwargs["image_mask"].dim() == 3:
+                    # each batch use the same mask
+                    kwargs["image_mask"] = kwargs["image_mask"][:, :, 0].squeeze(-1).squeeze(0)
+                    text_indices = torch.where(~kwargs["image_mask"])[0]
+                    sys_text_cnt = (text_indices < text_indices[0] + (kwargs["image_mask"] == True).nonzero(as_tuple=True)[0][0]).sum()
+                    usr_text_cnt = len(text_indices) - sys_text_cnt
+
+                random_discard = json.loads(os.environ['RANDOM_DISCARD'])
+                if random_discard['discard_before_layer'][idx]:
+                    ignored_mask = torch.zeros(
+                        hidden_states.shape[1],
+                        dtype=torch.bool,
+                        device=hidden_states.device
+                    )
+                    ignored_mask[:sys_text_cnt] = True
+                    ignored_mask[-usr_text_cnt:] = True
+
+                    hidden_states, position_embeddings, cache_position, position_ids, attention_mask = self._random_discard(
+                        hidden_states=hidden_states,
+                        position_embeddings=position_embeddings,
+                        cache_position=cache_position,
+                        position_ids=position_ids,
+                        attention_mask=attention_mask,
+                        ignored_mask=ignored_mask,
+                        discard_rate=random_discard['discard_rate'],
+                        seed=random_discard['discard_seed'],
+                    )
+
             hidden_states = decoder_layer(
                 hidden_states,
                 attention_mask=causal_mask_mapping[decoder_layer.attention_type],

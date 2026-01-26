@@ -21,6 +21,7 @@
 
 
 import collections.abc
+import os
 from dataclasses import dataclass
 from typing import Callable, Optional, Union
 
@@ -674,6 +675,7 @@ class InternVLModel(InternVLPreTrainedModel):
             past_key_values=past_key_values,
             inputs_embeds=inputs_embeds,
             cache_position=cache_position,
+            image_mask=special_image_mask if pixel_values is not None else None,
             **kwargs,
         )
 
@@ -909,6 +911,65 @@ class InternVLForConditionalGeneration(InternVLPreTrainedModel, GenerationMixin)
             image_hidden_states=outputs.image_hidden_states,
         )
 
+    def prepare_inputs_for_discard(
+        self,
+        input_ids,
+        inputs_embeds=None,
+        attention_mask=None,
+        cache_position=None,
+        discard_rate=None,
+        discard_before_layer=None,
+    ):
+        if input_ids is None or discard_rate is None or discard_rate == 0.0 or discard_before_layer is None:
+            return input_ids, inputs_embeds, attention_mask, cache_position
+
+        discard_times = sum(discard_before_layer)
+        special_image_mask = input_ids == self.config.image_token_id
+        keep_image_len = special_image_mask.sum(dim=-1)[0].item()
+        for i in range(discard_times):
+            keep_image_len = round(keep_image_len * (1.0 - discard_rate))
+
+        non_image_mask = ~special_image_mask
+        full_indices = torch.arange(
+            input_ids.shape[1],
+            device=special_image_mask.device
+        ).unsqueeze(0).expand(input_ids.shape[0], -1)
+        no_image_indices = [full_indices[i][non_image_mask[i]] for i in range(full_indices.shape[0])]
+        no_image_indices = torch.cat(no_image_indices, dim=0).view(full_indices.shape[0], -1)
+
+        start_idx = torch.argmax(special_image_mask.int(), dim=1)
+        offsets = torch.arange(keep_image_len, device=special_image_mask.device)
+        image_indices_after_prune = start_idx.unsqueeze(1) + offsets.unsqueeze(0)
+
+        full_indices_after_prune = torch.cat((image_indices_after_prune, no_image_indices), dim=1)
+        full_indices_after_prune = torch.sort(full_indices_after_prune, dim=1).values
+
+        input_ids = torch.gather(
+            input_ids,
+            1,
+            full_indices_after_prune,
+        )
+        if inputs_embeds is not None:
+            inputs_embeds = torch.gather(
+                inputs_embeds,
+                1,
+                full_indices_after_prune.unsqueeze(-1).expand(-1, -1, inputs_embeds.shape[-1]),
+            )
+        if attention_mask is not None:
+            attention_mask = torch.gather(
+                attention_mask,
+                1,
+                full_indices_after_prune,
+            )
+        if cache_position is not None:
+            cache_position = torch.gather(
+                cache_position,
+                0,
+                full_indices_after_prune.squeeze(0),
+            )
+
+        return input_ids, inputs_embeds, attention_mask, cache_position
+
     def prepare_inputs_for_generation(
         self,
         input_ids,
@@ -931,6 +992,15 @@ class InternVLForConditionalGeneration(InternVLPreTrainedModel, GenerationMixin)
             logits_to_keep=logits_to_keep,
             **kwargs,
         )
+
+        if os.environ.get("RANDOM_DISCARD", None):
+            if cache_position[0] == 0:
+                position_ids = model_inputs["position_ids"]
+            elif "position_ids" in model_inputs:
+                batch_size, _ = model_inputs["position_ids"].shape
+                position_ids = cache_position.unsqueeze(0).expand(batch_size, -1)
+
+            model_inputs["position_ids"] = position_ids
 
         if cache_position[0] == 0:
             # If we're in cached decoding stage, pixel values should be None because input ids do not contain special image token anymore
