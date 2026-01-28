@@ -491,14 +491,18 @@ class Qwen3Model(Qwen3PreTrainedModel):
                     usr_text_cnt = len(text_indices) - sys_text_cnt
 
                 random_discard = json.loads(os.environ['RANDOM_DISCARD'])
-                if random_discard['discard_before_layer'][idx]:
+                if random_discard["discard_rate"] > 0 and random_discard['discard_before_layer'][idx]:
                     ignored_mask = torch.zeros(
                         hidden_states.shape[1],
                         dtype=torch.bool,
                         device=hidden_states.device
                     )
-                    ignored_mask[:sys_text_cnt] = True
-                    ignored_mask[-usr_text_cnt:] = True
+                    if kwargs.get("image_mask") is not None:
+                        ignored_mask[:sys_text_cnt] = True
+                        ignored_mask[-usr_text_cnt:] = True
+                    else:
+                        # The first element of the position_ids is used for calculating the sequence length
+                        ignored_mask[0] = True
 
                     hidden_states, position_embeddings, cache_position, position_ids, attention_mask = self._random_discard(
                         hidden_states=hidden_states,
@@ -608,6 +612,93 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
         )
+
+    def prepare_inputs_for_discard(
+        self,
+        input_ids,
+        inputs_embeds=None,
+        attention_mask=None,
+        cache_position=None,
+        discard_rate=None,
+        discard_before_layer=None,
+    ):
+        if input_ids is None or discard_rate is None or discard_rate == 0.0 or discard_before_layer is None:
+            return input_ids, inputs_embeds, attention_mask, cache_position
+
+        discard_times = sum(discard_before_layer)
+        # exclude the first token
+        keep_text_len = input_ids.shape[1] - 1
+        for _ in range(discard_times):
+            keep_text_len = round(keep_text_len * (1.0 - discard_rate))
+        # add back the first token
+        keep_text_len += 1
+
+        indices_before_prune = torch.arange(
+            input_ids.shape[1],
+            device=input_ids.device
+        )
+        indices_after_prune = indices_before_prune[-keep_text_len:]
+
+        indices_after_prune = indices_after_prune.unsqueeze(0).expand(input_ids.shape[0], -1)
+
+        input_ids = torch.gather(
+            input_ids,
+            1,
+            indices_after_prune,
+        )
+        if inputs_embeds is not None:
+            inputs_embeds = torch.gather(
+                inputs_embeds,
+                1,
+                indices_after_prune.unsqueeze(-1).expand(-1, -1, inputs_embeds.shape[-1]),
+            )
+        if attention_mask is not None:
+            attention_mask = torch.gather(
+                attention_mask,
+                1,
+                indices_after_prune,
+            )
+        if cache_position is not None:
+            cache_position = torch.gather(
+                cache_position,
+                0,
+                indices_after_prune.squeeze(0),
+            )
+
+        return input_ids, inputs_embeds, attention_mask, cache_position
+
+    def prepare_inputs_for_generation(
+        self,
+        input_ids,
+        past_key_values=None,
+        inputs_embeds=None,
+        attention_mask=None,
+        cache_position=None,
+        logits_to_keep=None,
+        **kwargs,
+    ):
+        # Overwritten -- in specific circumstances we don't want to forward image inputs to the model
+
+        model_inputs = super().prepare_inputs_for_generation(
+            input_ids,
+            past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            cache_position=cache_position,
+            logits_to_keep=logits_to_keep,
+            **kwargs,
+        )
+
+        if os.environ.get("RANDOM_DISCARD", None):
+            if cache_position[0] == 0:
+                position_ids = model_inputs["position_ids"]
+            elif "position_ids" in model_inputs:
+                batch_size, _ = model_inputs["position_ids"].shape
+                position_ids = cache_position.unsqueeze(0).expand(batch_size, -1)
+
+            model_inputs["position_ids"] = position_ids
+
+        return model_inputs
 
 
 class Qwen3ForSequenceClassification(GenericForSequenceClassification, Qwen3PreTrainedModel):
