@@ -357,6 +357,7 @@ class LlamaModel(LlamaPreTrainedModel):
         cache_position: Optional[torch.LongTensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
+        causal_mask: Optional[torch.Tensor] = None,
         ignored_mask: Optional[torch.Tensor] = None,
         discard_rate: Optional[float] = None,
         seed: Optional[int] = None,
@@ -366,7 +367,7 @@ class LlamaModel(LlamaPreTrainedModel):
         excluding tokens in `ignored_mask`.
         """
         if not discard_rate or discard_rate <= 0.0:
-            return hidden_states, position_embeddings, cache_position, position_ids, attention_mask
+            return hidden_states, position_embeddings, cache_position, position_ids, attention_mask, causal_mask
 
         batch_size, seq_len, _ = hidden_states.shape
         device = hidden_states.device
@@ -416,8 +417,9 @@ class LlamaModel(LlamaPreTrainedModel):
         cache_position = cache_position[keep_indices.squeeze(0)] if cache_position is not None else None
         position_ids = position_ids[batch_indices, keep_indices] if position_ids is not None else None
         attention_mask = attention_mask[batch_indices, keep_indices] if attention_mask is not None else None
+        causal_mask = causal_mask[ :, :, :keep_indices.shape[1], :keep_indices.shape[1]] if causal_mask is not None else None
 
-        return hidden_states, (cos, sin), cache_position, position_ids, attention_mask
+        return hidden_states, (cos, sin), cache_position, position_ids, attention_mask, causal_mask
 
     @check_model_inputs()
     @auto_docstring
@@ -485,12 +487,20 @@ class LlamaModel(LlamaPreTrainedModel):
                     ignored_mask[:sys_text_cnt] = True
                     ignored_mask[-usr_text_cnt:] = True
 
-                    hidden_states, position_embeddings, cache_position, position_ids, attention_mask = self._random_discard(
+                    (
+                        hidden_states,
+                        position_embeddings,
+                        cache_position,
+                        position_ids,
+                        attention_mask,
+                        causal_mask,
+                    ) = self._random_discard(
                         hidden_states=hidden_states,
                         position_embeddings=position_embeddings,
                         cache_position=cache_position,
                         position_ids=position_ids,
                         attention_mask=attention_mask,
+                        causal_mask=causal_mask,
                         ignored_mask=ignored_mask,
                         discard_rate=random_discard['discard_rate'],
                         seed=random_discard['discard_seed'],
