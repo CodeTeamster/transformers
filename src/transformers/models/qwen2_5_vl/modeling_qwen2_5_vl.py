@@ -796,6 +796,7 @@ class Qwen2_5_VLTextModel(Qwen2_5_VLPreTrainedModel):
         cache_position: Optional[torch.LongTensor] = None,
         text_position_ids: Optional[torch.LongTensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
+        causal_mask_mapping: Optional[dict] = None,
         ignored_mask: Optional[torch.Tensor] = None,
         discard_rate: Optional[float] = None,
         seed: Optional[int] = None,
@@ -805,7 +806,10 @@ class Qwen2_5_VLTextModel(Qwen2_5_VLPreTrainedModel):
         excluding tokens in `ignored_mask`.
         """
         if not discard_rate or discard_rate <= 0.0:
-            return hidden_states, position_embeddings, cache_position, text_position_ids, attention_mask
+            return hidden_states, position_embeddings, cache_position, text_position_ids, attention_mask, causal_mask_mapping
+
+        if "sliding_attention" in causal_mask_mapping:
+            raise NotImplementedError("Random token discard is not implemented for sliding attention.")
 
         batch_size, seq_len, _ = hidden_states.shape
         device = hidden_states.device
@@ -855,8 +859,9 @@ class Qwen2_5_VLTextModel(Qwen2_5_VLPreTrainedModel):
         cache_position = cache_position[keep_indices.squeeze(0)] if cache_position is not None else None
         text_position_ids = text_position_ids[batch_indices, keep_indices] if text_position_ids is not None else None
         attention_mask = attention_mask[batch_indices, keep_indices] if attention_mask is not None else None
+        causal_mask_mapping["full_attention"] = causal_mask_mapping["full_attention"][:, :, :keep_indices.shape[1], :keep_indices.shape[1]] if causal_mask_mapping is not None else None
 
-        return hidden_states, (cos, sin), cache_position, text_position_ids, attention_mask
+        return hidden_states, (cos, sin), cache_position, text_position_ids, attention_mask, causal_mask_mapping
 
     @auto_docstring
     def forward(
@@ -978,12 +983,20 @@ class Qwen2_5_VLTextModel(Qwen2_5_VLPreTrainedModel):
                     ignored_mask[:sys_text_cnt] = True
                     ignored_mask[-usr_text_cnt:] = True
 
-                    hidden_states, position_embeddings, cache_position, text_position_ids, attention_mask = self._random_discard(
+                    (
+                        hidden_states,
+                        position_embeddings,
+                        cache_position,
+                        text_position_ids,
+                        attention_mask,
+                        causal_mask_mapping,
+                    ) = self._random_discard(
                         hidden_states=hidden_states,
                         position_embeddings=position_embeddings,
                         cache_position=cache_position,
                         text_position_ids=text_position_ids,
                         attention_mask=attention_mask,
+                        causal_mask_mapping=causal_mask_mapping,
                         ignored_mask=ignored_mask,
                         discard_rate=random_discard['discard_rate'],
                         seed=random_discard['discard_seed'],
